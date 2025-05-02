@@ -4,52 +4,84 @@ from sklearn.feature_selection import VarianceThreshold
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 import os
 
-def select_features_from_train(df: pd.DataFrame) -> (pd.DataFrame, list):
-    drop_path = os.path.join('data', 'rows_to_drop.csv')
+def drop_outliers(df: pd.DataFrame, drop_path: str) -> pd.DataFrame:
     if os.path.exists(drop_path):
         rows_to_drop = pd.read_csv(drop_path, header=None).squeeze().tolist()
         df = df.drop(index=rows_to_drop)
         print(f"✅ Dropped {len(rows_to_drop)} rows from train")
     else:
         print("⚠️ rows_to_drop.csv not found.")
+    return df
 
+def select_features(df: pd.DataFrame) -> list:
     dummy_cols = [col for col in df.columns if col.startswith('data_channel_') or col.startswith('weekday_')]
     numeric_cols = [col for col in df.columns if col not in dummy_cols and col not in {'id', 'shares', 'y'}]
 
     df_numeric = df[numeric_cols]
 
-    vt = VarianceThreshold(threshold=0.0)
+    vt = VarianceThreshold(threshold=0.001)
     vt.fit(df_numeric)
     low_var = df_numeric.columns[~vt.get_support()]
 
     corr = df_numeric.corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    high_corr = [c for c in upper.columns if any(upper[c] > 0.9)]
+    high_corr = [c for c in upper.columns if any(upper[c] > 0.95)]
 
     vif_vals = [variance_inflation_factor(df_numeric.values, i) for i in range(df_numeric.shape[1])]
-    vif_drop = df_numeric.columns[np.array(vif_vals) > 10]
+    vif_drop = df_numeric.columns[np.array(vif_vals) > 15]
 
     custom_drop = {'kw_avg_min'}
     drop_cols = set(low_var) | set(high_corr) | set(vif_drop) | custom_drop
 
     final_numeric = [c for c in numeric_cols if c not in drop_cols]
     final_cols = final_numeric + dummy_cols
-
-    df_result = df[final_cols + ['y']]
-    return df_result, final_cols  # 컬럼 리스트도 같이 반환
-
-def apply_feature_selection(df: pd.DataFrame, selected_cols: list) -> pd.DataFrame:
-    # test에는 y 없으니까 제외
-    return df[selected_cols]
+    return final_cols
 
 if __name__ == "__main__":
-    train = pd.read_csv('data/train_encoded.csv')
-    test = pd.read_csv('data/test_encoded.csv')
+    train_raw = pd.read_csv("data/train_encoded.csv")
+    test = pd.read_csv("data/test_encoded.csv")
 
-    train_sel, selected_cols = select_features_from_train(train)
-    test_sel = apply_feature_selection(test, selected_cols)
+    # 1. 이상치 제거
+    train_cleaned = drop_outliers(train_raw, "data/rows_to_drop.csv")
 
-    train_sel.to_csv('data/train_selected.csv', index=False)
-    test_sel.to_csv('data/test_selected.csv', index=False)
+    # 2. y 분리
+    y = train_cleaned['y']
+    train_features_only = train_cleaned.drop(columns=['y'])
 
-    print("✅ Feature selection complete — test와 train 컬럼 일치!")
+    # 3. 변수 선택
+    selected_cols = select_features(train_cleaned)
+
+    # 4. train: 선택된 컬럼 + y 병합
+    X_train_selected = train_features_only[selected_cols]
+    train_selected = pd.concat([X_train_selected, y], axis=1)
+    train_selected.to_csv("data/train_selected.csv", index=False)
+
+    # 5. test: 선택된 컬럼만 사용
+    test_selected = test[[col for col in selected_cols if col in test.columns]]
+    test_selected.to_csv("data/test_selected.csv", index=False)
+
+    # 6. 검증
+    print("\n🧪 결과 검증")
+    print(f"📊 train_selected: {train_selected.shape}")
+    print(f"📊 test_selected: {test_selected.shape}")
+
+    if 'y' in test_selected.columns:
+        raise ValueError("❌ test_selected에 'y' 컬럼이 포함되어 있음! 제거 필요 ❗")
+
+    mismatch = set(train_selected.columns) - {'y'} != set(test_selected.columns)
+    if mismatch:
+        print("❌ 컬럼 불일치! y 제외하고도 구조가 다름")
+        print("⚠️ train-only 컬럼:", set(train_selected.columns) - set(test_selected.columns) - {'y'})
+        print("⚠️ test-only 컬럼:", set(test_selected.columns) - (set(train_selected.columns) - {'y'}))
+    else:
+        print("✅ 컬럼 구조 일치 (y 제외)")
+
+    # 7. 중요 변수 검증
+    print("\n🔍 중요 변수 검증:")
+    important_cols = ['kw_max_min', 'global_sentiment_polarity']
+    missing_important = [col for col in important_cols if col not in train_selected.columns]
+    if missing_important:
+        print("❌ 중요 변수 누락됨:", missing_important)
+        raise ValueError("⚠️ 중요 변수가 train에 없습니다 — 기준을 다시 조정하세요!")
+    else:
+        print("✅ 중요 변수 모두 포함됨")
